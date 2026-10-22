@@ -150,7 +150,28 @@ await call('/plan-board/priority', { method: 'POST', body: { board: 'default', p
 const onDiskPri = JSON.parse(fs.readFileSync(defaultFile, 'utf8'));
 check('priority written to disk (cleared to 0)', onDiskPri.sections.long.items.find((i) => i.id === 'l1').priority === 0);
 
-// 10. corrupt document is not overwritten
+// 10. 收集 / 提出
+await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
+const notDone = await call('/plan-board/collect', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
+check('collect requires done', notDone.status === 400, `status=${notDone.status}`);
+await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
+const col = await call('/plan-board/collect', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
+check('collect returns 200', col.status === 200, `status=${col.status}`);
+check('archive holds the entry', col.json.doc.archive.length === 1);
+check('item left the section', col.json.doc.sections.long.items.length === 0);
+check('archive remembers original part', col.json.doc.archive[0].part === 'long');
+const aid = col.json.doc.archive[0].aid;
+const rest = await call('/plan-board/restore', { method: 'POST', body: { board: 'default', aid } });
+check('restore returns 200', rest.status === 200, `status=${rest.status}`);
+check('archive empty after restore', rest.json.doc.archive.length === 0);
+const backItem = rest.json.doc.sections.long.items.find((i) => i.text === '把 DSH 插件开发跑通');
+check('restored item is reopened', !!backItem && backItem.done === false);
+const onDiskArchive = JSON.parse(fs.readFileSync(defaultFile, 'utf8'));
+check('archive persisted on disk', Array.isArray(onDiskArchive.archive));
+const badRestore = await call('/plan-board/restore', { method: 'POST', body: { board: 'default', aid: 'nope' } });
+check('unknown aid rejected', badRestore.status === 404, `status=${badRestore.status}`);
+
+// 11. corrupt document is not overwritten
 fs.writeFileSync(defaultFile, '{"broken": ');
 const corrupt = await call('/plan-board/state.json?board=default');
 check('corrupt doc reports failure', corrupt.status === 500 && corrupt.json.ok === false);

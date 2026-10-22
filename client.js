@@ -77,12 +77,12 @@ window.__ModuleLoader__.load({
       });
     }
 
-    function Item({ item, part, onToggle, onPriority, showPriority }) {
+    function Item({ item, part, onToggle, onPriority, onCollect, showPriority }) {
       const ratio = itemRatio(item);
       const priority = item.priority || 0;
       return h(
         'div',
-        { className: showPriority ? `pb-item pb-imp-${priority}` : 'pb-item' },
+        { className: `${showPriority ? `pb-item pb-imp-${priority}` : 'pb-item'}${item.done ? ' pb-item-collectable' : ''}` },
         h(
           'div',
           { className: 'pb-item-head' },
@@ -115,10 +115,22 @@ window.__ModuleLoader__.load({
               ),
             )
           : null,
+        item.done && onCollect
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'pb-collect',
+                title: '收集到「已完成」抽屉',
+                onClick: () => onCollect(part, item.id),
+              },
+              '收集',
+            )
+          : null,
       );
     }
 
-    function Section({ part, section, collapsed, onToggleCollapse, onToggle, onPriority }) {
+    function Section({ part, section, collapsed, onToggleCollapse, onToggle, onPriority, onCollect }) {
       const ratio = sectionRatio(section);
       const done = section.items.filter((item) => item.done).length;
       const showProgress = !NO_PROGRESS.has(part);
@@ -155,10 +167,67 @@ window.__ModuleLoader__.load({
                       part,
                       onToggle,
                       onPriority,
+                      onCollect,
                       showPriority: !NO_PROGRESS.has(part),
                     }),
                   ),
             ),
+      );
+    }
+
+    const ARCHIVE_PART_LABEL = { long: '长期', mid: '中期', short: '短期' };
+
+    // 已完成抽屉：按完成日期倒序分组，组内再按原分区，分区内按重要度。
+    function ArchiveDrawer({ entries, onRestore }) {
+      const byDay = new Map();
+      for (const entry of entries) {
+        const stamp = entry.completedAt || entry.archivedAt || '';
+        const day = stamp.slice(0, 10) || '未知日期';
+        if (!byDay.has(day)) byDay.set(day, []);
+        byDay.get(day).push(entry);
+      }
+      const days = [...byDay.keys()].sort((a, b) => b.localeCompare(a));
+      return h(
+        'div',
+        { className: 'pb-archive' },
+        days.map((day, dayIndex) => {
+          const list = byDay.get(day);
+          const groups = new Map();
+          for (const entry of [...list].sort((a, b) => (a.priority || 4) - (b.priority || 4))) {
+            const key = entry.part;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(entry);
+          }
+          return h(
+            'details',
+            { key: day, className: 'pb-archive-day', open: dayIndex === 0 },
+            h('summary', { className: 'pb-archive-summary' }, `${day} · ${list.length} 条`),
+            [...groups.entries()].map(([part, items]) =>
+              h(
+                'div',
+                { key: part, className: 'pb-archive-group' },
+                h('div', { className: 'pb-archive-group-title' }, ARCHIVE_PART_LABEL[part] || part),
+                items.map((entry) =>
+                  h(
+                    'div',
+                    { key: entry.aid, className: 'pb-archive-item' },
+                    h('span', { className: 'pb-archive-text' }, entry.text),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'pb-archive-restore',
+                        onClick: () => onRestore(entry.aid),
+                        title: '提出来并重新打开',
+                      },
+                      '提出',
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        }),
       );
     }
 
@@ -167,6 +236,7 @@ window.__ModuleLoader__.load({
       const [collapsed, setCollapsed] = useState({});
       const [busy, setBusy] = useState('');
       const [menuOpen, setMenuOpen] = useState(false);
+      const [archiveOpen, setArchiveOpen] = useState(false);
       const [boards, setBoards] = useState([]);
       const [board, setBoard] = useState(() => {
         try {
@@ -299,8 +369,57 @@ window.__ModuleLoader__.load({
         [board],
       );
 
-      const onToggleCollapse = useCallback((part) => {
-        setCollapsed((previous) => ({ ...previous, [part]: !previous[part] }));
+      const onCollect = useCallback(
+        async (part, id) => {
+          setBusy(`collect:${part}:${id}`);
+          try {
+            const response = await fetch('/plan-board/collect', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ board, part, id }),
+            });
+            const payload = await response.json();
+            if (payload && payload.ok && payload.doc) {
+              if (payload.boards) setBoards(payload.boards);
+              setState((previous) => ({ ...previous, ok: true, error: '', doc: payload.doc }));
+            } else {
+              setState((previous) => ({ ...previous, error: (payload && payload.error) || '收集失败' }));
+            }
+          } catch (error) {
+            setState((previous) => ({ ...previous, error: String((error && error.message) || error) }));
+          } finally {
+            setBusy('');
+          }
+        },
+        [board],
+      );
+
+      const onRestore = useCallback(
+        async (aid) => {
+          setBusy(`restore:${aid}`);
+          try {
+            const response = await fetch('/plan-board/restore', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ board, aid }),
+            });
+            const payload = await response.json();
+            if (payload && payload.ok && payload.doc) {
+              if (payload.boards) setBoards(payload.boards);
+              setState((previous) => ({ ...previous, ok: true, error: '', doc: payload.doc }));
+            } else {
+              setState((previous) => ({ ...previous, error: (payload && payload.error) || '提出失败' }));
+            }
+          } catch (error) {
+            setState((previous) => ({ ...previous, error: String((error && error.message) || error) }));
+          } finally {
+            setBusy('');
+          }
+        },
+        [board],
+      );
+
+      const onToggleCollapse = useCallback((part) => {        setCollapsed((previous) => ({ ...previous, [part]: !previous[part] }));
       }, []);
 
       const doc = state.doc;
@@ -335,6 +454,18 @@ window.__ModuleLoader__.load({
             h('span', { className: 'pb-board-caret' }, menuOpen ? '▴' : '▾'),
           ),
           doc ? h('span', { className: 'pb-muted' }, overall === null ? '总进度 —' : `总进度 ${percent(overall)}`) : null,
+          doc && doc.archive && doc.archive.length > 0
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: archiveOpen ? 'pb-refresh pb-on' : 'pb-refresh',
+                  onClick: () => setArchiveOpen((open) => !open),
+                  title: '已完成（收集）',
+                },
+                `✓${doc.archive.length}`,
+              )
+            : null,
           h(
             'button',
             { type: 'button', className: 'pb-refresh', onClick: () => void createBoard(), title: '新建计划' },
@@ -369,6 +500,9 @@ window.__ModuleLoader__.load({
               ),
             )
           : null,
+        archiveOpen && doc && doc.archive && doc.archive.length > 0
+          ? h(ArchiveDrawer, { entries: doc.archive, onRestore })
+          : null,
         state.error ? h('div', { className: 'pb-error' }, state.error) : null,
         state.loading
           ? h('div', { className: 'pb-empty' }, '读取中…')
@@ -385,6 +519,7 @@ window.__ModuleLoader__.load({
                     onToggleCollapse,
                     onToggle,
                     onPriority,
+                    onCollect,
                   }),
                 ),
                 h('div', { className: 'pb-foot' }, doc.updatedAt ? `更新于 ${doc.updatedAt.replace('T', ' ').slice(0, 16)}` : ''),
@@ -428,8 +563,28 @@ window.__ModuleLoader__.load({
       .pb-bar { height:4px; border-radius:2px; background:var(--dsw-alias-bg-sunken, rgba(255,255,255,.08)); overflow:hidden; }
       .pb-bar-fill { height:100%; background:var(--dsw-alias-accent, #4c8dff); transition:width .25s ease; }
       .pb-items { display:flex; flex-direction:column; gap:8px; padding-left:2px; }
-      .pb-item { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-radius:8px;
+      .pb-item { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-radius:8px; position:relative;
         background:var(--dsw-alias-bg-elevated, rgba(255,255,255,.04)); }
+      .pb-item-collectable { padding-bottom:26px; }
+      .pb-collect { position:absolute; right:8px; bottom:6px; padding:1px 6px; border-radius:5px; cursor:pointer;
+        font-size:10px; line-height:16px; font-family:inherit; color:var(--dsw-alias-text-secondary, #9aa0a6);
+        background:transparent; border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
+      .pb-collect:hover { color:inherit; background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
+      .pb-on { color:var(--dsw-alias-accent, #4c8dff); border-color:var(--dsw-alias-accent, #4c8dff); }
+      .pb-archive { display:flex; flex-direction:column; gap:6px; padding:6px; border-radius:8px;
+        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14));
+        background:var(--dsw-alias-bg-sunken, rgba(0,0,0,.18)); }
+      .pb-archive-day > summary { cursor:pointer; font-size:12px; padding:2px 0;
+        color:var(--dsw-alias-text-secondary, #9aa0a6); }
+      .pb-archive-group { padding:4px 0 2px 10px; }
+      .pb-archive-group-title { font-size:11px; margin-bottom:2px; color:var(--dsw-alias-text-secondary, #9aa0a6); }
+      .pb-archive-item { display:flex; align-items:center; gap:6px; padding:2px 0; }
+      .pb-archive-text { flex:1; font-size:12px; text-decoration:line-through; opacity:.7;
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .pb-archive-restore { flex:none; padding:1px 6px; border-radius:5px; cursor:pointer; font-size:10px;
+        font-family:inherit; color:var(--dsw-alias-text-secondary, #9aa0a6); background:transparent;
+        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
+      .pb-archive-restore:hover { color:inherit; background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
       .pb-item-head { display:flex; align-items:center; gap:8px; }
       .pb-imp-1 { border-left:3px solid #e5534b; }
       .pb-imp-2 { border-left:3px solid #d29922; }

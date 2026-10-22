@@ -54,7 +54,31 @@ function toSlug(title) {
 function emptyDoc(title) {
   const sections = {};
   for (const part of PARTS) sections[part] = { title: DEFAULT_TITLES[part], items: [] };
-  return { version: 1, title: title || '未命名', updatedAt: new Date().toISOString(), sections };
+  return {
+    version: 1,
+    title: title || '未命名',
+    updatedAt: new Date().toISOString(),
+    sections,
+    // 已完成并"收集"起来的条目。元素带 part（原分区）与时间戳，主列表不再包含它们。
+    archive: [],
+  };
+}
+
+function normalizeItem(item, part, index) {
+  return {
+    id: typeof item.id === 'string' && item.id ? item.id : `${part}-${index + 1}`,
+    text: item.text,
+    done: item.done === true,
+    // 1 = 最高，3 = 最低，0 = 未设。只认整数 1..3，其余一律当未设。
+    priority: Number.isInteger(item.priority) && item.priority >= 1 && item.priority <= 3 ? item.priority : 0,
+    note: typeof item.note === 'string' ? item.note : '',
+    updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : '',
+    steps: Array.isArray(item.steps)
+      ? item.steps
+          .filter((step) => step && typeof step.text === 'string')
+          .map((step) => ({ text: step.text, done: step.done === true }))
+      : [],
+  };
 }
 
 /** Coerce whatever is on disk into the shape the client renders, without inventing items. */
@@ -71,21 +95,18 @@ function normalize(raw, fallbackTitle) {
     const items = Array.isArray(section.items) ? section.items : [];
     doc.sections[part].items = items
       .filter((item) => item && typeof item === 'object' && typeof item.text === 'string')
-      .map((item, index) => ({
-        id: typeof item.id === 'string' && item.id ? item.id : `${part}-${index + 1}`,
-        text: item.text,
-        done: item.done === true,
-        // 1 = 最高，3 = 最低，0 = 未设。只认整数 1..3，其余一律当未设。
-        priority: Number.isInteger(item.priority) && item.priority >= 1 && item.priority <= 3 ? item.priority : 0,
-        note: typeof item.note === 'string' ? item.note : '',
-        updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : '',
-        steps: Array.isArray(item.steps)
-          ? item.steps
-              .filter((step) => step && typeof step.text === 'string')
-              .map((step) => ({ text: step.text, done: step.done === true }))
-          : [],
-      }));
+      .map((item, index) => normalizeItem(item, part, index));
   }
+  const archived = Array.isArray(raw.archive) ? raw.archive : [];
+  doc.archive = archived
+    .filter((entry) => entry && typeof entry === 'object' && typeof entry.text === 'string' && PARTS.includes(entry.part))
+    .map((entry, index) => ({
+      ...normalizeItem(entry, entry.part, index),
+      aid: typeof entry.aid === 'string' && entry.aid ? entry.aid : `a-${index + 1}`,
+      part: entry.part,
+      completedAt: typeof entry.completedAt === 'string' ? entry.completedAt : '',
+      archivedAt: typeof entry.archivedAt === 'string' ? entry.archivedAt : '',
+    }));
   return doc;
 }
 
@@ -240,6 +261,54 @@ function boardFromUrl(rawUrl) {
   return board && board.trim() ? board.trim() : '';
 }
 
+function archiveId() {
+  return `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 把一条已完成的条目移出主列表、放进归档。 */
+function collect(doc, part, id) {
+  const section = doc.sections[part];
+  if (!section) throw new Error(`未知分区：${part}`);
+  const index = section.items.findIndex((item) => item.id === id);
+  if (index < 0) throw new Error(`未找到条目：${id}`);
+  const item = section.items[index];
+  if (!item.done) throw new Error('只有已完成的条目才能收集');
+  const now = new Date().toISOString();
+  section.items.splice(index, 1);
+  doc.archive.unshift({
+    ...item,
+    aid: archiveId(),
+    part,
+    // 完成时间用最后一次状态变更粗略代表（勾选完成时 updatedAt 就是那一刻）。
+    completedAt: item.updatedAt || now,
+    archivedAt: now,
+  });
+  doc.updatedAt = now;
+}
+
+/** 把归档条目放回原分区，并重新打开（done 归 false）。 */
+function restore(doc, aid) {
+  const index = doc.archive.findIndex((entry) => entry.aid === aid);
+  if (index < 0) throw new Error(`未找到归档条目：${aid}`);
+  const [entry] = doc.archive.splice(index, 1);
+  const section = doc.sections[entry.part];
+  if (!section) throw new Error(`未知分区：${entry.part}`);
+  const taken = new Set(section.items.map((item) => item.id));
+  let id = entry.id || `${entry.part}-restored`;
+  if (taken.has(id)) id = `${id}-r${Date.now().toString(36)}`;
+  const now = new Date().toISOString();
+  section.items.push({
+    id,
+    text: entry.text,
+    done: false,
+    priority: entry.priority || 0,
+    note: entry.note || '',
+    updatedAt: now,
+    steps: (entry.steps || []).map((step) => ({ text: step.text, done: false })),
+  });
+  doc.updatedAt = now;
+}
+
 export function apply(ctx, config) {
   const boardsDir = resolveBoardsDir(config);
 
@@ -347,6 +416,57 @@ export function apply(ctx, config) {
           sendJson(res, 200, { ok: true, slug, doc: current.doc, boards: listBoards(boardsDir) });
         } catch (error) {
           sendJson(res, 400, { ok: false, error: String((error && error.message) || error) });
+        }
+      },
+    }),
+  );
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/plan-board/collect',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+        const denied = rejectWrite(req);
+        if (denied) return sendJson(res, 403, { ok: false, error: denied });
+        try {
+          const body = await readBody(req);
+          const { board, part, id } = body || {};
+          if (!PARTS.includes(part)) return sendJson(res, 400, { ok: false, error: '未知分区' });
+          if (typeof id !== 'string' || !id) return sendJson(res, 400, { ok: false, error: '缺少条目 id' });
+          const slug = typeof board === 'string' && board.trim() ? board.trim() : 'default';
+          const current = readBoard(boardsDir, slug);
+          if (!current.ok) return sendJson(res, 409, current);
+          collect(current.doc, part, id);
+          writeBoard(boardsDir, slug, current.doc);
+          sendJson(res, 200, { ok: true, slug, doc: current.doc, boards: listBoards(boardsDir) });
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: String((error && error.message) || error) });
+        }
+      },
+    }),
+  );
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/plan-board/restore',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+        const denied = rejectWrite(req);
+        if (denied) return sendJson(res, 403, { ok: false, error: denied });
+        try {
+          const body = await readBody(req);
+          const { board, aid } = body || {};
+          if (typeof aid !== 'string' || !aid) return sendJson(res, 400, { ok: false, error: '缺少归档 id' });
+          const slug = typeof board === 'string' && board.trim() ? board.trim() : 'default';
+          const current = readBoard(boardsDir, slug);
+          if (!current.ok) return sendJson(res, 409, current);
+          restore(current.doc, aid);
+          writeBoard(boardsDir, slug, current.doc);
+          sendJson(res, 200, { ok: true, slug, doc: current.doc, boards: listBoards(boardsDir) });
+        } catch (error) {
+          sendJson(res, 404, { ok: false, error: String((error && error.message) || error) });
         }
       },
     }),

@@ -47,9 +47,25 @@ plan-board/
     "short":  { "title": "短期", "items": [] },
     "idea":   { "title": "预想", "items": [] },
     "advice": { "title": "agent 建议", "items": [] }
-  }
+  },
+  "archive": []                        // 已完成并"收集"起来的条目
 }
 ```
+
+归档条目（`archive[]`）是在原条目基础上多三个字段：
+
+```jsonc
+{
+  "aid": "a-1792670000000-ab12cd",     // 归档 id，提出时用它定位
+  "part": "short",                     // 原分区，提出时放回这里
+  "text": "…", "note": "", "priority": 2, "steps": [],
+  "completedAt": "2026-10-22T12:00:00.000Z",   // 完成时间（勾选完成那一刻的 updatedAt）
+  "archivedAt": "2026-10-22T13:00:00.000Z"
+}
+```
+
+- **收集**：只有 `done: true` 的条目能收集；它从主列表移入 `archive`，抽屉按 `completedAt` 的日期倒序分组，组内按原分区（长期/中期/短期）、再按重要度排序。
+- **提出**：从 `archive` 放回 `part` 指定的分区，**`done` 归 false、子步骤全部重置**——从归档里拿出来的东西按定义是还没做完的。
 
 条目：
 
@@ -83,6 +99,8 @@ plan-board/
 | POST | `/plan-board/toggle` | `{ board, part, id, step? }`，`step` 省略则是整条勾选 |
 | POST | `/plan-board/board` | `{ title }` 新建一个方案（slug 由名称生成，重名返回 409） |
 | POST | `/plan-board/priority` | `{ board, part, id, priority }`，`priority` 取 0..3；只改这一条 |
+| POST | `/plan-board/collect` | `{ board, part, id }`，仅接受已完成的条目；移入 `archive` |
+| POST | `/plan-board/restore` | `{ board, aid }`，放回原分区并重新打开 |
 
 写路由只接受回环地址，并拒绝 `Sec-Fetch-Site: cross-site`。
 
