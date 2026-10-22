@@ -1,0 +1,6 @@
+# plan-board 组合包装载声明：只插一行宿主插件。
+# 数据目录通过行配置覆盖（不填则用 $DSH_HOME/plan-board/）。
+- insert:
+    - id: plan-board
+      name: 'dsh-plan-board'
+      config: {}

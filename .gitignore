@@ -1,0 +1,4 @@
+node_modules/
+*.tgz
+_smoke-tmp/
+.DS_Store
