@@ -110,33 +110,86 @@ function normalize(raw, fallbackTitle) {
   return doc;
 }
 
-/** First call creates the directory and migrates a pre-boards single file, once. */
-function ensureDir(dir) {
-  if (fs.existsSync(dir)) return;
-  fs.mkdirSync(dir, { recursive: true });
+/**
+ * Layout is one directory per project: <boardsDir>/<project>/<plan>.json.
+ * Every call migrates leftovers from the two older layouts first, so a
+ * half-migrated directory never hides a board.
+ */
+function migrateLayout(dir) {
+  // 1) pre-boards single file at $DSH_HOME/plan-board.json -> default/main.json
   const legacy = path.join(dshHome(), 'plan-board.json');
-  if (fs.existsSync(legacy)) {
+  try {
+    if (fs.existsSync(legacy)) {
+      const projectDir = path.join(dir, 'default');
+      fs.mkdirSync(projectDir, { recursive: true });
+      const target = path.join(projectDir, 'main.json');
+      if (!fs.existsSync(target)) fs.copyFileSync(legacy, target);
+    }
+  } catch {
+    /* best effort: the legacy file stays where it is */
+  }
+  // 2) flat <name>.json files at the root -> <name>/main.json
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!BOARD_FILE.test(name)) continue;
+    const from = path.join(dir, name);
     try {
-      fs.copyFileSync(legacy, path.join(dir, 'default.json'));
+      if (!fs.statSync(from).isFile()) continue;
+      const project = toSlug(name.replace(BOARD_FILE, '')) || 'default';
+      const projectDir = path.join(dir, project);
+      fs.mkdirSync(projectDir, { recursive: true });
+      const target = path.join(projectDir, 'main.json');
+      if (!fs.existsSync(target)) fs.renameSync(from, target);
     } catch {
-      /* best effort: the legacy file is left untouched */
+      /* leave an unmovable file alone; it stays visible on the next scan */
     }
   }
 }
 
-function boardsOf(dir) {
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((name) => BOARD_FILE.test(name))
-    .map((name) => ({ slug: name.replace(BOARD_FILE, ''), file: path.join(dir, name) }));
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  migrateLayout(dir);
+}
+
+/** Every `<project>/<plan>.json` under the boards directory. */
+function plansOf(dir) {
+  const out = [];
+  let projects = [];
+  try {
+    projects = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of projects) {
+    if (!entry.isDirectory()) continue;
+    let files = [];
+    try {
+      files = fs.readdirSync(path.join(dir, entry.name));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!BOARD_FILE.test(file)) continue;
+      out.push({
+        project: entry.name,
+        plan: file.replace(BOARD_FILE, ''),
+        file: path.join(dir, entry.name, file),
+      });
+    }
+  }
+  return out;
 }
 
 function listBoards(dir) {
   ensureDir(dir);
-  return boardsOf(dir)
-    .map(({ slug, file }) => {
-      let title = slug;
+  return plansOf(dir)
+    .map(({ project, plan, file }) => {
+      let title = plan;
       let updatedAt = '';
       let count = 0;
       try {
@@ -148,29 +201,41 @@ function listBoards(dir) {
           0,
         );
       } catch {
-        title = `${slug}（无法解析）`;
+        title = `${plan}（无法解析）`;
       }
-      return { slug, title, updatedAt, count };
+      return { slug: `${project}/${plan}`, project, plan, title, updatedAt, count };
     })
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
+/** `<project>/<plan>` -> parts; anything else is rejected rather than guessed. */
+function parseSlug(slug) {
+  const parts = String(slug || '').split('/');
+  if (parts.length !== 2) return null;
+  const project = toSlug(parts[0]);
+  const plan = toSlug(parts[1]);
+  if (!project || !plan) return null;
+  return { project, plan };
+}
+
 function readBoard(dir, slug) {
   ensureDir(dir);
-  const file = path.join(dir, `${slug}.json`);
+  const parsed = parseSlug(slug);
+  if (!parsed) return { ok: false, slug, error: `不合法的计划标识：${slug}（应为 项目/计划）` };
+  const file = path.join(dir, parsed.project, `${parsed.plan}.json`);
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      const doc = emptyDoc(slug);
+      const doc = emptyDoc(parsed.plan);
       writeBoard(dir, slug, doc);
       return { ok: true, slug, doc, created: true };
     }
     return { ok: false, slug, error: `读取失败：${error && error.message}` };
   }
   try {
-    return { ok: true, slug, doc: normalize(JSON.parse(text), slug) };
+    return { ok: true, slug, doc: normalize(JSON.parse(text), parsed.plan) };
   } catch (error) {
     // Never overwrite a document we cannot parse: it may be hand-edited.
     return { ok: false, slug, error: `${slug}.json 解析失败：${error && error.message}` };
@@ -179,7 +244,11 @@ function readBoard(dir, slug) {
 
 function writeBoard(dir, slug, doc) {
   ensureDir(dir);
-  const file = path.join(dir, `${slug}.json`);
+  const parsed = parseSlug(slug);
+  if (!parsed) throw new Error(`不合法的计划标识：${slug}`);
+  const projectDir = path.join(dir, parsed.project);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const file = path.join(projectDir, `${parsed.plan}.json`);
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
   fs.writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
   fs.renameSync(tmp, file);
@@ -261,6 +330,13 @@ function boardFromUrl(rawUrl) {
   return board && board.trim() ? board.trim() : '';
 }
 
+/** A missing `board` falls back to the first known board, then to default/main. */
+function resolveSlug(dir, requested) {
+  if (typeof requested === 'string' && requested.trim()) return requested.trim();
+  const boards = listBoards(dir);
+  return (boards[0] && boards[0].slug) || 'default/main';
+}
+
 function archiveId() {
   return `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -330,7 +406,7 @@ export function apply(ctx, config) {
       handler: (req, res) => {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { ok: false, error: '只支持 GET' });
         const boards = listBoards(boardsDir);
-        const slug = boardFromUrl(req.url) || (boards[0] && boards[0].slug) || 'default';
+        const slug = boardFromUrl(req.url) || (boards[0] && boards[0].slug) || 'default/main';
         const result = readBoard(boardsDir, slug);
         sendJson(res, result.ok ? 200 : 500, { ...result, boards, dir: boardsDir });
       },
@@ -350,7 +426,7 @@ export function apply(ctx, config) {
           const { board, part, id, step } = body || {};
           if (!PARTS.includes(part)) return sendJson(res, 400, { ok: false, error: '未知分区' });
           if (typeof id !== 'string' || !id) return sendJson(res, 400, { ok: false, error: '缺少条目 id' });
-          const slug = typeof board === 'string' && board.trim() ? board.trim() : 'default';
+          const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
           if (!current.ok) return sendJson(res, 409, current);
           toggle(current.doc, part, id, step);
@@ -373,12 +449,18 @@ export function apply(ctx, config) {
         if (denied) return sendJson(res, 403, { ok: false, error: denied });
         try {
           const body = await readBody(req);
-          const title = typeof body.title === 'string' ? body.title.trim() : '';
-          const slug = toSlug(title);
-          if (!slug) return sendJson(res, 400, { ok: false, error: '名称不合法' });
-          if (fs.existsSync(path.join(boardsDir, `${slug}.json`))) {
-            return sendJson(res, 409, { ok: false, error: '同名计划已存在' });
+          const project = toSlug(typeof body.project === 'string' ? body.project.trim() : '');
+          const plan = toSlug(typeof body.plan === 'string' ? body.plan.trim() : '');
+          const title =
+            typeof body.title === 'string' && body.title.trim() ? body.title.trim() : plan;
+          if (!project || !plan) {
+            return sendJson(res, 400, { ok: false, error: '项目名和计划名都不能为空' });
           }
+          const file = path.join(boardsDir, project, `${plan}.json`);
+          if (fs.existsSync(file)) {
+            return sendJson(res, 409, { ok: false, error: `项目「${project}」下已有计划「${plan}」` });
+          }
+          const slug = `${project}/${plan}`;
           const doc = emptyDoc(title);
           writeBoard(boardsDir, slug, doc);
           sendJson(res, 200, { ok: true, slug, doc, boards: listBoards(boardsDir) });
@@ -404,7 +486,7 @@ export function apply(ctx, config) {
           if (typeof id !== 'string' || !id) return sendJson(res, 400, { ok: false, error: '缺少条目 id' });
           const next = Number(priority);
           if (![0, 1, 2, 3].includes(next)) return sendJson(res, 400, { ok: false, error: 'priority 只能是 0..3' });
-          const slug = typeof board === 'string' && board.trim() ? board.trim() : 'default';
+          const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
           if (!current.ok) return sendJson(res, 409, current);
           const item = current.doc.sections[part].items.find((candidate) => candidate.id === id);
@@ -434,7 +516,7 @@ export function apply(ctx, config) {
           const { board, part, id } = body || {};
           if (!PARTS.includes(part)) return sendJson(res, 400, { ok: false, error: '未知分区' });
           if (typeof id !== 'string' || !id) return sendJson(res, 400, { ok: false, error: '缺少条目 id' });
-          const slug = typeof board === 'string' && board.trim() ? board.trim() : 'default';
+          const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
           if (!current.ok) return sendJson(res, 409, current);
           collect(current.doc, part, id);
@@ -459,7 +541,7 @@ export function apply(ctx, config) {
           const body = await readBody(req);
           const { board, aid } = body || {};
           if (typeof aid !== 'string' || !aid) return sendJson(res, 400, { ok: false, error: '缺少归档 id' });
-          const slug = typeof board === 'string' && board.trim() ? board.trim() : 'default';
+          const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
           if (!current.ok) return sendJson(res, 409, current);
           restore(current.doc, aid);

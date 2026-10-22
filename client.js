@@ -70,6 +70,15 @@ window.__ModuleLoader__.load({
     // 规则：未完成在前；同组内按重要度（1 最高）；未设排在已设之后；其余保持原序。
     const PRIORITY_RANK = (p) => (p === 0 ? 4 : p);
 
+    function groupBoards(boards) {
+      const map = new Map();
+      for (const board of boards) {
+        if (!map.has(board.project)) map.set(board.project, []);
+        map.get(board.project).push(board);
+      }
+      return [...map.entries()];
+    }
+
     function orderedItems(items) {
       return [...items].sort((a, b) => {
         if (a.done !== b.done) return a.done ? 1 : -1;
@@ -237,7 +246,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('');
       const [menuOpen, setMenuOpen] = useState(false);
       const [creating, setCreating] = useState(false);
-      const [newTitle, setNewTitle] = useState('');
+      const [newProject, setNewProject] = useState('');
+      const [newPlan, setNewPlan] = useState('main');
       const [archiveOpen, setArchiveOpen] = useState(false);
       const [boards, setBoards] = useState([]);
       const [board, setBoard] = useState(() => {
@@ -298,14 +308,15 @@ window.__ModuleLoader__.load({
 
       // 不用 window.prompt：Electron 没有实现它（返回 undefined，点了像没反应）。
       const createBoard = useCallback(async () => {
-        const title = newTitle.trim();
-        if (!title) return;
+        const project = newProject.trim();
+        const plan = newPlan.trim();
+        if (!project || !plan) return;
         setBusy('create');
         try {
           const response = await fetch('/plan-board/board', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ title }),
+            body: JSON.stringify({ project, plan }),
           });
           const payload = await response.json();
           if (!payload || !payload.ok) {
@@ -317,13 +328,12 @@ window.__ModuleLoader__.load({
           remember(payload.slug);
           setState({ loading: false, ok: true, doc: payload.doc, error: '' });
           setCreating(false);
-          setNewTitle('');
         } catch (error) {
           setState((previous) => ({ ...previous, error: String((error && error.message) || error) }));
         } finally {
           setBusy('');
         }
-      }, [newTitle, remember]);
+      }, [newProject, newPlan, remember]);
 
       const onToggle = useCallback(
         async (part, id, step) => {
@@ -458,7 +468,11 @@ window.__ModuleLoader__.load({
               title: '切换计划（每个项目一个）',
               'aria-expanded': menuOpen,
             },
-            h('span', { className: 'pb-board-name' }, activeBoard ? activeBoard.title : '（还没有计划）'),
+            h(
+              'span',
+              { className: 'pb-board-name' },
+              activeBoard ? `${activeBoard.project} / ${activeBoard.plan}` : '（还没有计划）',
+            ),
             h('span', { className: 'pb-board-caret' }, menuOpen ? '▴' : '▾'),
           ),
           doc ? h('span', { className: 'pb-muted' }, overall === null ? '总进度 —' : `总进度 ${percent(overall)}`) : null,
@@ -488,9 +502,11 @@ window.__ModuleLoader__.load({
               className: 'pb-refresh pb-new',
               onClick: () => {
                 setMenuOpen(false);
+                setNewProject(activeBoard ? activeBoard.project : '');
+                setNewPlan('main');
                 setCreating((open) => !open);
               },
-              title: '新建计划（每个项目一个）',
+              title: '新建计划（项目 / 计划名）',
             },
             '＋',
           ),
@@ -506,17 +522,30 @@ window.__ModuleLoader__.load({
               { className: 'pb-create' },
               h('input', {
                 className: 'pb-input',
-                value: newTitle,
-                placeholder: '新计划名称（建议用工作目录名）',
+                value: newProject,
+                placeholder: '项目（建议用工作目录名）',
                 autoFocus: true,
-                onChange: (event) => setNewTitle(event.target.value),
+                onChange: (event) => setNewProject(event.target.value),
                 onKeyDown: (event) => {
                   if (event.key === 'Enter') {
                     event.preventDefault();
                     void createBoard();
                   } else if (event.key === 'Escape') {
                     setCreating(false);
-                    setNewTitle('');
+                  }
+                },
+              }),
+              h('input', {
+                className: 'pb-input pb-input-plan',
+                value: newPlan,
+                placeholder: '计划名',
+                onChange: (event) => setNewPlan(event.target.value),
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    void createBoard();
+                  } else if (event.key === 'Escape') {
+                    setCreating(false);
                   }
                 },
               }),
@@ -526,7 +555,7 @@ window.__ModuleLoader__.load({
                   type: 'button',
                   className: 'pb-btn pb-btn-primary',
                   onClick: () => void createBoard(),
-                  disabled: busy === 'create' || !newTitle.trim(),
+                  disabled: busy === 'create' || !newProject.trim() || !newPlan.trim(),
                 },
                 '创建',
               ),
@@ -535,10 +564,7 @@ window.__ModuleLoader__.load({
                 {
                   type: 'button',
                   className: 'pb-btn',
-                  onClick: () => {
-                    setCreating(false);
-                    setNewTitle('');
-                  },
+                  onClick: () => setCreating(false),
                 },
                 '取消',
               ),
@@ -549,20 +575,27 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'pb-board-menu' },
               boards.length === 0 ? h('div', { className: 'pb-empty' }, '还没有计划，点 ＋ 新建') : null,
-              boards.map((item) =>
+              groupBoards(boards).map(([project, plans]) =>
                 h(
-                  'button',
-                  {
-                    key: item.slug,
-                    type: 'button',
-                    className: item.slug === board ? 'pb-board-item pb-board-item-on' : 'pb-board-item',
-                    onClick: () => {
-                      switchBoard(item.slug);
-                      setMenuOpen(false);
-                    },
-                  },
-                  h('span', { className: 'pb-board-item-name' }, item.title),
-                  h('span', { className: 'pb-board-item-count' }, `${item.count} 条`),
+                  'div',
+                  { key: project, className: 'pb-board-group' },
+                  h('div', { className: 'pb-board-group-title' }, project),
+                  plans.map((item) =>
+                    h(
+                      'button',
+                      {
+                        key: item.slug,
+                        type: 'button',
+                        className: item.slug === board ? 'pb-board-item pb-board-item-on' : 'pb-board-item',
+                        onClick: () => {
+                          switchBoard(item.slug);
+                          setMenuOpen(false);
+                        },
+                      },
+                      h('span', { className: 'pb-board-item-name' }, item.plan),
+                      h('span', { className: 'pb-board-item-count' }, `${item.count} 条`),
+                    ),
+                  ),
                 ),
               ),
             )
@@ -615,6 +648,11 @@ window.__ModuleLoader__.load({
       .pb-board-item-on { background:var(--dsw-alias-bg-selected, rgba(76,141,255,.16)); }
       .pb-board-item-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
       .pb-board-item-count { flex:none; font-size:11px; color:var(--dsw-alias-text-secondary, #9aa0a6); }
+      .pb-board-group { display:flex; flex-direction:column; gap:2px; padding-top:2px; }
+      .pb-board-group + .pb-board-group { border-top:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.10)); margin-top:2px; }
+      .pb-board-group-title { padding:2px 8px; font-size:10px; letter-spacing:.02em;
+        color:var(--dsw-alias-text-secondary, #9aa0a6); }
+      .pb-input-plan { flex:0 0 96px; }
       .pb-muted { color:var(--dsw-alias-text-secondary, #9aa0a6); font-size:12px; }
       .pb-refresh { margin-left:auto; background:transparent; border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14));
         color:inherit; border-radius:6px; width:24px; height:24px; cursor:pointer; }

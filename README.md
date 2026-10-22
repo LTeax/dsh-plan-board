@@ -2,7 +2,7 @@
 
 分区计划看板，挂在 DSH Web / 桌面端**右栏**。**一个项目一份 JSON**，所有对话共享同一份。
 
-- **宿主半侧**（`index.js`）：读写 `<boardsDir>/<slug>.json`，暴露四个只走本机的路由。
+- **宿主半侧**（`index.js`）：读写 `<boardsDir>/<项目>/<计划>.json`，暴露七个只走本机的路由。
 - **浏览器半侧**（`client.js`）：注册右栏 tab 类型 `plan-board`，顶部下拉切换项目，正文每 3 秒拉一次状态；勾选会回调 `/plan-board/toggle` 立即落盘。
 
 ## 安装
@@ -17,29 +17,33 @@
 
 2. 装完**完全退出客户端**再打开（宿主半侧要重新加载）。
 3. 右栏 → **添加** → 「计划看板」。
-4. 顶部 **＋** 新建一个项目，slug 建议直接用工作目录名。
+4. 顶部 **＋** 新建：填「项目（建议用工作目录名）」+「计划名（默认 main）」。
 
 升级：非官方插件没有一键更新，先卸载再按同一 spec 重装。
 
 ## 数据文件
 
-默认目录 `$DSH_HOME/plan-board/`（Windows：`%USERPROFILE%\.dsh\plan-board\`），一个项目一个文件：
+默认目录 `$DSH_HOME/plan-board/`（Windows：`%USERPROFILE%\.dsh\plan-board\`）。**一个项目一个目录，项目下可以有多份计划书**：
 
 ```
 plan-board/
-├── tickflow-stock-panel.json
-└── default-workspace.json
+├── tickflow-stock-panel/
+│   ├── main.json              ← 主计划
+│   └── refactor-q4.json       ← 同一项目的第二份
+└── default-workspace/
+    └── main.json
 ```
 
-- slug 由面板「＋ 新建」时输入的名称生成（中文可用，只替换 `\ / : * ? " < > |`）。
-- 约定：**slug = 工作目录名**，agent 按当前工作目录找对应文件。
+- 计划标识（`slug`）= `<项目>/<计划名>`，例如 `tickflow-stock-panel/main`。
+- **项目名**约定 = 工作目录名（agent 按这个找）；**计划名**是给人看的，可以随时改，只要同一个项目内不重名。
+- 不同项目可以用同名计划（`A/main` 与 `B/main` 互不干扰）。
 - 要换目录，在 `cordis.patch.yml` 的 `config` 里写 `boardsDir`（绝对路径，支持 `~` 开头）。
-- 旧版单文件 `$DSH_HOME/plan-board.json` 会在目录首次创建时自动迁移成 `default.json`。
+- 迁移是自动的：老的扁平 `<名称>.json` 会被搬进 `<名称>/main.json`，pre-boards 的单文件 `$DSH_HOME/plan-board.json` 会变成 `default/main.json`。
 
 ```jsonc
 {
   "version": 1,
-  "title": "tickflow-stock-panel",   // 面板下拉里显示的名字
+  "title": "main",                   // 计划名（可改）
   "updatedAt": "2026-10-21T00:00:00.000Z",
   "sections": {
     "long":   { "title": "长期", "items": [] },
@@ -94,10 +98,10 @@ plan-board/
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/plan-board/boards.json` | 列出 `{ slug, title, updatedAt, count }` |
+| GET | `/plan-board/boards.json` | 列出 `{ slug, project, plan, title, updatedAt, count }` |
 | GET | `/plan-board/state.json?board=<slug>` | 返回 `{ ok, slug, doc, boards }`；解析失败时 `ok:false` 且**不写回** |
 | POST | `/plan-board/toggle` | `{ board, part, id, step? }`，`step` 省略则是整条勾选 |
-| POST | `/plan-board/board` | `{ title }` 新建一个方案（slug 由名称生成，重名返回 409） |
+| POST | `/plan-board/board` | `{ project, plan }` 新建计划（同一项目内重名返回 409，跨项目允许同名） |
 | POST | `/plan-board/priority` | `{ board, part, id, priority }`，`priority` 取 0..3；只改这一条 |
 | POST | `/plan-board/collect` | `{ board, part, id }`，仅接受已完成的条目；移入 `archive` |
 | POST | `/plan-board/restore` | `{ board, aid }`，放回原分区并重新打开 |

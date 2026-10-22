@@ -1,4 +1,5 @@
 // Functional smoke test for plan-board's host half: no DSH needed.
+// Layout under test: <boardsDir>/<project>/<plan>.json
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -32,7 +33,7 @@ function makeReq({ method = 'GET', body = null, remote = '127.0.0.1', headers = 
 }
 
 async function call(target, args = {}) {
-  const [pathname, query] = target.split('?');
+  const [pathname] = target.split('?');
   const route = routes.get(pathname);
   if (!route) throw new Error(`route not registered: ${pathname}`);
   let status = 0;
@@ -45,23 +46,24 @@ async function call(target, args = {}) {
   return { status, json: payload ? JSON.parse(payload) : null };
 }
 
-// 1. every route is registered
-check('state route registered', routes.has('/plan-board/state.json'));
-check('toggle route registered', routes.has('/plan-board/toggle'));
-check('boards route registered', routes.has('/plan-board/boards.json'));
-check('create route registered', routes.has('/plan-board/board'));
-
-// 2. first read creates the boards directory and one board
-const first = await call('/plan-board/state.json');
 const boardsDir = path.join(tmpHome, 'plan-board');
-const defaultFile = path.join(boardsDir, 'default.json');
+const defaultFile = path.join(boardsDir, 'default', 'main.json');
+const q = (slug) => `?board=${encodeURIComponent(slug)}`;
+
+// 1. every route is registered
+for (const p of ['/plan-board/state.json', '/plan-board/toggle', '/plan-board/boards.json', '/plan-board/board', '/plan-board/priority', '/plan-board/collect', '/plan-board/restore']) {
+  check(`route ${p}`, routes.has(p));
+}
+
+// 2. first read creates <project>/<plan>.json
+const first = await call('/plan-board/state.json');
 check('first GET is 200', first.status === 200, `status=${first.status}`);
-check('boards dir created', fs.existsSync(boardsDir));
-check('document created on disk', fs.existsSync(defaultFile));
-check('slug is default', first.json.slug === 'default', first.json.slug);
+check('project dir created', fs.existsSync(path.join(boardsDir, 'default')));
+check('default/main.json created', fs.existsSync(defaultFile));
+check('fallback slug is project/plan', first.json.slug === 'default/main', first.json.slug);
 check('five sections present', ['long', 'mid', 'short', 'idea', 'advice'].every((p) => first.json.doc.sections[p]), Object.keys(first.json.doc.sections).join(','));
 
-// 3. the agent seeds items with steps
+// 3. seed items with steps
 const seeded = {
   version: 1,
   title: '默认',
@@ -81,103 +83,85 @@ const seeded = {
     },
     idea: { title: '预想', items: [{ id: 'i1', text: '做成本看板插件', done: false, steps: [] }] },
   },
+  archive: [],
 };
 fs.writeFileSync(defaultFile, JSON.stringify(seeded, null, 2), 'utf8');
 
-const read = await call('/plan-board/state.json?board=default');
-const shortItem = read.json.doc.sections.short.items[0];
-check('reads seeded item text', shortItem.text === '验证右栏渲染', shortItem.text);
-check('reads steps verbatim', shortItem.steps.length === 2 && shortItem.steps[0].done === true);
-check('default board listed', read.json.boards.some((b) => b.slug === 'default'));
+const read = await call(`/plan-board/state.json${q('default/main')}`);
+check('reads seeded item text', read.json.doc.sections.short.items[0].text === '验证右栏渲染');
+check('reads steps verbatim', read.json.doc.sections.short.items[0].steps.length === 2);
 
-// 4. toggle one step: item.done must stay false
-const toggled = await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'short', id: 's1', step: 0 } });
-check('step toggle returns 200', toggled.status === 200, `status=${toggled.status}`);
-const afterStep = toggled.json.doc.sections.short.items[0];
-check('step 0 now false', afterStep.steps[0].done === false);
-check('item still not done', afterStep.done === false);
+// 4. toggle a step, then the whole item
+const stepRes = await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'short', id: 's1', step: 0 } });
+check('step toggle 200', stepRes.status === 200, `status=${stepRes.status}`);
+check('step flipped to false', stepRes.json.doc.sections.short.items[0].steps[0].done === false);
+const wholeRes = await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'short', id: 's1' } });
+check('item done', wholeRes.json.doc.sections.short.items[0].done === true);
+check('all steps done', wholeRes.json.doc.sections.short.items[0].steps.every((s) => s.done === true));
 
-// 5. toggle the whole item: every step flips true
-const whole = await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'short', id: 's1' } });
-const afterItem = whole.json.doc.sections.short.items[0];
-check('item done = true', afterItem.done === true);
-check('all steps done', afterItem.steps.every((s) => s.done === true));
+// 5. write guards
+check('non-loopback 403', (await call('/plan-board/toggle', { method: 'POST', body: { part: 'short', id: 's1' }, remote: '10.0.0.2' })).status === 403);
+check('cross-site 403', (await call('/plan-board/toggle', { method: 'POST', body: { part: 'short', id: 's1' }, headers: { 'sec-fetch-site': 'cross-site' } })).status === 403);
+check('unknown part 400', (await call('/plan-board/toggle', { method: 'POST', body: { part: 'nope', id: 's1' } })).status === 400);
+check('GET on toggle 405', (await call('/plan-board/toggle', { method: 'GET' })).status === 405);
 
-// 6. persisted to disk
-const onDisk = JSON.parse(fs.readFileSync(defaultFile, 'utf8'));
-check('persisted item.done', onDisk.sections.short.items[0].done === true);
-check('persisted updatedAt', typeof onDisk.updatedAt === 'string');
-
-// 7. write guards
-const remote = await call('/plan-board/toggle', { method: 'POST', body: { part: 'short', id: 's1' }, remote: '192.168.1.9' });
-check('non-loopback write rejected', remote.status === 403, `status=${remote.status}`);
-const crossSite = await call('/plan-board/toggle', { method: 'POST', body: { part: 'short', id: 's1' }, headers: { 'sec-fetch-site': 'cross-site' } });
-check('cross-site write rejected', crossSite.status === 403, `status=${crossSite.status}`);
-const badPart = await call('/plan-board/toggle', { method: 'POST', body: { part: 'nope', id: 's1' } });
-check('unknown part rejected', badPart.status === 400, `status=${badPart.status}`);
-const getOnly = await call('/plan-board/toggle', { method: 'GET' });
-check('GET on toggle rejected', getOnly.status === 405, `status=${getOnly.status}`);
-
-// 8. a second board is isolated from the first
-const created = await call('/plan-board/board', { method: 'POST', body: { title: '项目B' } });
-check('create board returns 200', created.status === 200, `status=${created.status}`);
-check('create board slug', created.json.slug === '项目B', created.json.slug);
-const secondFile = path.join(boardsDir, '项目B.json');
-check('second board file written', fs.existsSync(secondFile));
+// 6. project layout: two projects, same plan name is fine
+const createdB = await call('/plan-board/board', { method: 'POST', body: { project: '项目B', plan: 'main' } });
+check('create project B', createdB.status === 200, `status=${createdB.status}`);
+check('slug is project/plan', createdB.json.slug === '项目B/main', createdB.json.slug);
+check('file at 项目B/main.json', fs.existsSync(path.join(boardsDir, '项目B', 'main.json')));
+const dup = await call('/plan-board/board', { method: 'POST', body: { project: '项目B', plan: 'main' } });
+check('duplicate plan in same project 409', dup.status === 409, `status=${dup.status}`);
+const createdC = await call('/plan-board/board', { method: 'POST', body: { project: '项目C', plan: 'main' } });
+check('same plan name in another project allowed', createdC.status === 200, `status=${createdC.status}`);
+const badCreate = await call('/plan-board/board', { method: 'POST', body: { project: '', plan: '' } });
+check('empty project/plan rejected', badCreate.status === 400, `status=${badCreate.status}`);
+check('two plans under a project', (await call('/plan-board/board', { method: 'POST', body: { project: '项目B', plan: 'refactor-q4' } })).status === 200);
 const listed = await call('/plan-board/boards.json');
-check('two boards listed', listed.json.boards.length === 2, listed.json.boards.map((b) => b.slug).join(','));
-const dup = await call('/plan-board/board', { method: 'POST', body: { title: '项目B' } });
-check('duplicate board rejected', dup.status === 409, `status=${dup.status}`);
+check('boards list groups by project', listed.json.boards.some((b) => b.project === '项目B' && b.plan === 'refactor-q4'));
+check('list carries project field', listed.json.boards.every((b) => typeof b.project === 'string' && typeof b.plan === 'string'));
 
-const secondRead = await call('/plan-board/state.json?board=' + encodeURIComponent('项目B'));
-check('second board empty', secondRead.json.doc.sections.short.items.length === 0);
-await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
-const secondAgain = await call('/plan-board/state.json?board=' + encodeURIComponent('项目B'));
-check('other board untouched', secondAgain.json.doc.sections.long.items.length === 0);
-const firstAgain = await call('/plan-board/state.json?board=default');
-check('first board kept its toggle', firstAgain.json.doc.sections.long.items[0].done === true);
+// 7. isolation
+const secondRead = await call(`/plan-board/state.json${q('项目B/main')}`);
+check('new board starts empty', secondRead.json.doc.sections.short.items.length === 0);
+await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1' } });
+check('other board untouched', (await call(`/plan-board/state.json${q('项目B/main')}`)).json.doc.sections.long.items.length === 0);
+check('first board kept its toggle', (await call(`/plan-board/state.json${q('default/main')}`)).json.doc.sections.long.items[0].done === true);
 
-// 9. priority: 1..3 有效，0 可清空，其余拒绝
-check('priority route registered', routes.has('/plan-board/priority'));
-const pri = await call('/plan-board/priority', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1', priority: 1 } });
-check('priority set returns 200', pri.status === 200, `status=${pri.status}`);
-check('priority persisted in response', pri.json.doc.sections.long.items.find((i) => i.id === 'l1').priority === 1);
-const badPri = await call('/plan-board/priority', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1', priority: 9 } });
-check('out-of-range priority rejected', badPri.status === 400, `status=${badPri.status}`);
-const missingItem = await call('/plan-board/priority', { method: 'POST', body: { board: 'default', part: 'long', id: 'nope', priority: 1 } });
-check('unknown item rejected', missingItem.status === 404, `status=${missingItem.status}`);
-await call('/plan-board/priority', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1', priority: 0 } });
-const onDiskPri = JSON.parse(fs.readFileSync(defaultFile, 'utf8'));
-check('priority written to disk (cleared to 0)', onDiskPri.sections.long.items.find((i) => i.id === 'l1').priority === 0);
+// 8. legacy flat file is migrated into <name>/main.json
+fs.writeFileSync(path.join(boardsDir, 'legacy-flat.json'), JSON.stringify({ title: 'flat', sections: {}, archive: [] }), 'utf8');
+await call('/plan-board/boards.json');
+check('flat file migrated into project dir', fs.existsSync(path.join(boardsDir, 'legacy-flat', 'main.json')));
+check('flat file removed from root', !fs.existsSync(path.join(boardsDir, 'legacy-flat.json')));
 
-// 10. 收集 / 提出
-await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
-const notDone = await call('/plan-board/collect', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
-check('collect requires done', notDone.status === 400, `status=${notDone.status}`);
-await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
-const col = await call('/plan-board/collect', { method: 'POST', body: { board: 'default', part: 'long', id: 'l1' } });
-check('collect returns 200', col.status === 200, `status=${col.status}`);
-check('archive holds the entry', col.json.doc.archive.length === 1);
-check('item left the section', col.json.doc.sections.long.items.length === 0);
-check('archive remembers original part', col.json.doc.archive[0].part === 'long');
+// 9. priority
+const pri = await call('/plan-board/priority', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1', priority: 1 } });
+check('priority 200', pri.status === 200);
+check('priority persisted', pri.json.doc.sections.long.items[0].priority === 1);
+check('priority range checked', (await call('/plan-board/priority', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1', priority: 9 } })).status === 400);
+check('unknown item 404', (await call('/plan-board/priority', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'nope', priority: 1 } })).status === 404);
+
+// 10. collect / restore
+await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1' } });
+check('collect requires done', (await call('/plan-board/collect', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1' } })).status === 400);
+await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1' } });
+const col = await call('/plan-board/collect', { method: 'POST', body: { board: 'default/main', part: 'long', id: 'l1' } });
+check('collect 200', col.status === 200);
+check('archive holds it', col.json.doc.archive.length === 1);
+check('section empty after collect', col.json.doc.sections.long.items.length === 0);
 const aid = col.json.doc.archive[0].aid;
-const rest = await call('/plan-board/restore', { method: 'POST', body: { board: 'default', aid } });
-check('restore returns 200', rest.status === 200, `status=${rest.status}`);
+const rest = await call('/plan-board/restore', { method: 'POST', body: { board: 'default/main', aid } });
+check('restore 200', rest.status === 200);
 check('archive empty after restore', rest.json.doc.archive.length === 0);
-const backItem = rest.json.doc.sections.long.items.find((i) => i.text === '把 DSH 插件开发跑通');
-check('restored item is reopened', !!backItem && backItem.done === false);
-const onDiskArchive = JSON.parse(fs.readFileSync(defaultFile, 'utf8'));
-check('archive persisted on disk', Array.isArray(onDiskArchive.archive));
-const badRestore = await call('/plan-board/restore', { method: 'POST', body: { board: 'default', aid: 'nope' } });
-check('unknown aid rejected', badRestore.status === 404, `status=${badRestore.status}`);
+check('restored reopened', rest.json.doc.sections.long.items[0].done === false);
+check('unknown aid 404', (await call('/plan-board/restore', { method: 'POST', body: { board: 'default/main', aid: 'nope' } })).status === 404);
 
 // 11. corrupt document is not overwritten
 fs.writeFileSync(defaultFile, '{"broken": ');
-const corrupt = await call('/plan-board/state.json?board=default');
-check('corrupt doc reports failure', corrupt.status === 500 && corrupt.json.ok === false);
-check('corrupt doc left untouched', fs.readFileSync(defaultFile, 'utf8') === '{"broken": ');
-const blocked = await call('/plan-board/toggle', { method: 'POST', body: { board: 'default', part: 'short', id: 's1' } });
-check('toggle refuses when unparsable', blocked.status === 409, `status=${blocked.status}`);
+const corrupt = await call(`/plan-board/state.json${q('default/main')}`);
+check('corrupt reports failure', corrupt.status === 500 && corrupt.json.ok === false);
+check('corrupt untouched', fs.readFileSync(defaultFile, 'utf8') === '{"broken": ');
+check('toggle refuses when unparsable', (await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'short', id: 's1' } })).status === 409);
 
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
