@@ -456,19 +456,31 @@ window.__ModuleLoader__.load({
           doc ? h('span', { className: 'pb-muted' }, overall === null ? '总进度 —' : `总进度 ${percent(overall)}`) : null,
           doc && doc.archive && doc.archive.length > 0
             ? h(
-                'button',
-                {
-                  type: 'button',
-                  className: archiveOpen ? 'pb-refresh pb-on' : 'pb-refresh',
-                  onClick: () => setArchiveOpen((open) => !open),
-                  title: '已完成（收集）',
-                },
-                `✓${doc.archive.length}`,
+                'div',
+                { className: archiveOpen ? 'pb-archive-box pb-on' : 'pb-archive-box' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'pb-archive-toggle',
+                    onClick: () => setArchiveOpen((open) => !open),
+                    title: archiveOpen ? '收起已完成' : '展开已完成',
+                    'aria-expanded': archiveOpen,
+                  },
+                  '已完成',
+                ),
+                // 数量只是标签，不参与点击
+                h('span', { className: 'pb-archive-count', 'aria-hidden': true }, String(doc.archive.length)),
               )
             : null,
           h(
             'button',
-            { type: 'button', className: 'pb-refresh', onClick: () => void createBoard(), title: '新建计划' },
+            {
+              type: 'button',
+              className: 'pb-refresh pb-new',
+              onClick: () => void createBoard(),
+              title: '新建计划（每个项目一个）',
+            },
             '＋',
           ),
           h(
@@ -551,6 +563,16 @@ window.__ModuleLoader__.load({
       .pb-muted { color:var(--dsw-alias-text-secondary, #9aa0a6); font-size:12px; }
       .pb-refresh { margin-left:auto; background:transparent; border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14));
         color:inherit; border-radius:6px; width:24px; height:24px; cursor:pointer; }
+      .pb-refresh:hover { background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
+      .pb-new { font-size:14px; line-height:1; }
+      .pb-archive-box { display:flex; align-items:stretch; height:22px; border-radius:6px; overflow:hidden;
+        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
+      .pb-archive-toggle { padding:0 7px; border:0; background:transparent; color:inherit; font:inherit;
+        font-size:11px; cursor:pointer; }
+      .pb-archive-toggle:hover { background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
+      .pb-archive-count { display:flex; align-items:center; padding:0 6px; font-size:11px; cursor:default;
+        user-select:none; color:var(--dsw-alias-text-secondary, #9aa0a6);
+        border-left:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
       .pb-body { display:flex; flex-direction:column; gap:14px; }
       .pb-section { display:flex; flex-direction:column; gap:6px; }
       .pb-section-head { display:flex; align-items:center; gap:6px; background:transparent; border:0; padding:2px 0;
@@ -570,7 +592,8 @@ window.__ModuleLoader__.load({
         font-size:10px; line-height:16px; font-family:inherit; color:var(--dsw-alias-text-secondary, #9aa0a6);
         background:transparent; border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
       .pb-collect:hover { color:inherit; background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
-      .pb-on { color:var(--dsw-alias-accent, #4c8dff); border-color:var(--dsw-alias-accent, #4c8dff); }
+      .pb-archive-box.pb-on { border-color:var(--dsw-alias-accent, #4c8dff); }
+      .pb-archive-box.pb-on .pb-archive-toggle { color:var(--dsw-alias-accent, #4c8dff); }
       .pb-archive { display:flex; flex-direction:column; gap:6px; padding:6px; border-radius:8px;
         border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14));
         background:var(--dsw-alias-bg-sunken, rgba(0,0,0,.18)); }
