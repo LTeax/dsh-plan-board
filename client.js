@@ -166,6 +166,7 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState({ loading: true, ok: false, doc: null, error: '' });
       const [collapsed, setCollapsed] = useState({});
       const [busy, setBusy] = useState('');
+      const [menuOpen, setMenuOpen] = useState(false);
       const [boards, setBoards] = useState([]);
       const [board, setBoard] = useState(() => {
         try {
@@ -310,6 +311,7 @@ window.__ModuleLoader__.load({
       const overall = tracked.length
         ? tracked.reduce((total, part) => total + sectionRatio(doc.sections[part]), 0) / tracked.length
         : null;
+      const activeBoard = boards.find((item) => item.slug === board) || boards[0] || null;
 
       return h(
         'div',
@@ -319,16 +321,18 @@ window.__ModuleLoader__.load({
           'header',
           { className: 'pb-head' },
           h('span', { className: 'pb-title' }, '计划'),
+          // 原生 select 的下拉由系统绘制、无法上色，所以自己画一个面板内列表。
           h(
-            'select',
+            'button',
             {
-              className: 'pb-select',
-              value: board || (boards[0] ? boards[0].slug : ''),
-              onChange: (event) => switchBoard(event.target.value),
+              type: 'button',
+              className: 'pb-board-btn',
+              onClick: () => setMenuOpen((open) => !open),
               title: '切换计划（每个项目一个）',
+              'aria-expanded': menuOpen,
             },
-            boards.length === 0 ? h('option', { value: '' }, '（还没有计划）') : null,
-            boards.map((item) => h('option', { key: item.slug, value: item.slug }, item.title)),
+            h('span', { className: 'pb-board-name' }, activeBoard ? activeBoard.title : '（还没有计划）'),
+            h('span', { className: 'pb-board-caret' }, menuOpen ? '▴' : '▾'),
           ),
           doc ? h('span', { className: 'pb-muted' }, overall === null ? '总进度 —' : `总进度 ${percent(overall)}`) : null,
           h(
@@ -342,6 +346,29 @@ window.__ModuleLoader__.load({
             '↻',
           ),
         ),
+        menuOpen
+          ? h(
+              'div',
+              { className: 'pb-board-menu' },
+              boards.length === 0 ? h('div', { className: 'pb-empty' }, '还没有计划，点 ＋ 新建') : null,
+              boards.map((item) =>
+                h(
+                  'button',
+                  {
+                    key: item.slug,
+                    type: 'button',
+                    className: item.slug === board ? 'pb-board-item pb-board-item-on' : 'pb-board-item',
+                    onClick: () => {
+                      switchBoard(item.slug);
+                      setMenuOpen(false);
+                    },
+                  },
+                  h('span', { className: 'pb-board-item-name' }, item.title),
+                  h('span', { className: 'pb-board-item-count' }, `${item.count} 条`),
+                ),
+              ),
+            )
+          : null,
         state.error ? h('div', { className: 'pb-error' }, state.error) : null,
         state.loading
           ? h('div', { className: 'pb-empty' }, '读取中…')
@@ -371,9 +398,21 @@ window.__ModuleLoader__.load({
         font-size:13px; line-height:1.5; color:var(--dsw-alias-text-primary, #e6e6e6); }
       .pb-head { display:flex; align-items:center; gap:8px; }
       .pb-title { font-weight:600; font-size:13px; }
-      .pb-select { max-width:150px; height:24px; border-radius:6px; background:transparent; color:inherit;
-        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); font:inherit; padding:0 4px; }
-      .pb-select option { color:#111; }
+      .pb-board-btn { display:flex; align-items:center; gap:4px; max-width:150px; height:24px; padding:0 6px;
+        border-radius:6px; background:transparent; color:inherit; font:inherit; cursor:pointer;
+        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
+      .pb-board-btn:hover { background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
+      .pb-board-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+      .pb-board-caret { flex:none; font-size:10px; color:var(--dsw-alias-text-secondary, #9aa0a6); }
+      .pb-board-menu { display:flex; flex-direction:column; gap:2px; padding:4px; border-radius:8px;
+        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14));
+        background:var(--dsw-alias-bg-elevated, rgba(255,255,255,.05)); }
+      .pb-board-item { display:flex; align-items:center; gap:8px; width:100%; padding:5px 8px; border:0;
+        border-radius:6px; background:transparent; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+      .pb-board-item:hover { background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
+      .pb-board-item-on { background:var(--dsw-alias-bg-selected, rgba(76,141,255,.16)); }
+      .pb-board-item-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+      .pb-board-item-count { flex:none; font-size:11px; color:var(--dsw-alias-text-secondary, #9aa0a6); }
       .pb-muted { color:var(--dsw-alias-text-secondary, #9aa0a6); font-size:12px; }
       .pb-refresh { margin-left:auto; background:transparent; border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14));
         color:inherit; border-radius:6px; width:24px; height:24px; cursor:pointer; }
