@@ -95,6 +95,16 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'pb-item-head' },
+          item.code
+            ? h(
+                'span',
+                {
+                  className: 'pb-code',
+                  title: `编号 ${item.code}：在对话里直接说这个编号就能定位到这条`,
+                },
+                item.code,
+              )
+            : null,
           showPriority &&
             h(
               'button',
@@ -220,6 +230,7 @@ window.__ModuleLoader__.load({
                   h(
                     'div',
                     { key: entry.aid, className: 'pb-archive-item' },
+                    entry.code ? h('span', { className: 'pb-code pb-code-dim' }, entry.code) : null,
                     h('span', { className: 'pb-archive-text' }, entry.text),
                     h(
                       'button',
@@ -711,6 +722,12 @@ window.__ModuleLoader__.load({
         border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
       .pb-archive-restore:hover { color:inherit; background:var(--dsw-alias-bg-hover, rgba(255,255,255,.06)); }
       .pb-item-head { display:flex; align-items:center; gap:8px; }
+      .pb-code { flex:none; min-width:26px; padding:0 4px; border-radius:4px; text-align:center;
+        font-size:10px; line-height:16px; letter-spacing:.02em; white-space:nowrap; user-select:all;
+        font-family:ui-monospace, SFMono-Regular, Consolas, monospace;
+        color:var(--dsw-alias-text-secondary, #9aa0a6);
+        border:1px solid var(--dsw-alias-border-subtle, rgba(255,255,255,.14)); }
+      .pb-code-dim { opacity:.55; user-select:text; }
       .pb-imp-1 { border-left:3px solid #e5534b; }
       .pb-imp-2 { border-left:3px solid #d29922; }
       .pb-imp-3 { border-left:3px solid #4c8dff; }

@@ -90,6 +90,16 @@ fs.writeFileSync(defaultFile, JSON.stringify(seeded, null, 2), 'utf8');
 const read = await call(`/plan-board/state.json${q('default/main')}`);
 check('reads seeded item text', read.json.doc.sections.short.items[0].text === '验证右栏渲染');
 check('reads steps verbatim', read.json.doc.sections.short.items[0].steps.length === 2);
+// 编号：分区字母 + 序号，缺号的老文档读到就补
+check(
+  'code issued per section (L1 / S1 / I1)',
+  read.json.doc.sections.long.items[0].code === 'L1' &&
+    read.json.doc.sections.short.items[0].code === 'S1' &&
+    read.json.doc.sections.idea.items[0].code === 'I1',
+  [read.json.doc.sections.long.items[0].code, read.json.doc.sections.short.items[0].code, read.json.doc.sections.idea.items[0].code].join(','),
+);
+check('issued code written back to disk', JSON.parse(fs.readFileSync(defaultFile, 'utf8')).sections.short.items[0].code === 'S1');
+check('codeSeq high-water written back', JSON.parse(fs.readFileSync(defaultFile, 'utf8')).codeSeq.S === 1);
 
 // 4. toggle a step, then the whole item
 const stepRes = await call('/plan-board/toggle', { method: 'POST', body: { board: 'default/main', part: 'short', id: 's1', step: 0 } });
@@ -154,9 +164,61 @@ const rest = await call('/plan-board/restore', { method: 'POST', body: { board: 
 check('restore 200', rest.status === 200);
 check('archive empty after restore', rest.json.doc.archive.length === 0);
 check('restored reopened', rest.json.doc.sections.long.items[0].done === false);
+check('archived entry kept its code', col.json.doc.archive[0].code === 'L1', col.json.doc.archive[0].code);
+check('restore returns the same code', rest.json.doc.sections.long.items[0].code === 'L1', rest.json.doc.sections.long.items[0].code);
 check('unknown aid 404', (await call('/plan-board/restore', { method: 'POST', body: { board: 'default/main', aid: 'nope' } })).status === 404);
 
-// 11. corrupt document is not overwritten
+// 11. 编号：重复去重、错字母重发、高水位不复用
+const codeFile = path.join(boardsDir, 'codes', 'main.json');
+fs.mkdirSync(path.dirname(codeFile), { recursive: true });
+const seedCodes = (doc) => fs.writeFileSync(codeFile, JSON.stringify(doc), 'utf8');
+seedCodes({
+  version: 1,
+  title: 'codes',
+  updatedAt: new Date().toISOString(),
+  sections: {
+    long: { title: '长期', items: [{ id: 'd', text: '高水位', code: 'L9' }] },
+    short: {
+      title: '短期',
+      items: [
+        { id: 'a', text: '先到先得', code: 'S1' },
+        { id: 'b', text: '重复的 S1', code: 'S1' },
+        { id: 'c', text: '错字母的 L9', code: 'L9' },
+      ],
+    },
+  },
+  archive: [],
+});
+const coded = (await call(`/plan-board/state.json${q('codes/main')}`)).json.doc;
+const shortCodes = coded.sections.short.items.map((item) => item.code);
+check('duplicate code reissued', shortCodes[0] === 'S1' && shortCodes[1] === 'S2', shortCodes.join(','));
+check('wrong-letter code reissued', shortCodes[2] === 'S3', shortCodes[2]);
+check('valid code kept as written', coded.sections.long.items[0].code === 'L9', coded.sections.long.items[0].code);
+check('codeSeq records high-water', JSON.parse(fs.readFileSync(codeFile, 'utf8')).codeSeq.S === 3);
+
+// 删掉最大的号：新条目不能继承它
+seedCodes({
+  version: 1,
+  title: 'codes',
+  updatedAt: new Date().toISOString(),
+  codeSeq: { L: 9, M: 0, S: 3, I: 0, A: 0 },
+  sections: {
+    long: { title: '长期', items: [] },
+    short: {
+      title: '短期',
+      items: [
+        { id: 'a', text: '先到先得', code: 'S1' },
+        { id: 'n', text: '新加的（没有 code）' },
+      ],
+    },
+  },
+  archive: [],
+});
+const afterDelete = (await call(`/plan-board/state.json${q('codes/main')}`)).json.doc;
+check('deleted high-water code not reused', afterDelete.sections.short.items[1].code === 'S4', afterDelete.sections.short.items[1].code);
+check('codeSeq persisted through read', JSON.parse(fs.readFileSync(codeFile, 'utf8')).codeSeq.S === 4);
+
+// 12. corrupt document is not overwritten
 fs.writeFileSync(defaultFile, '{"broken": ');
 const corrupt = await call(`/plan-board/state.json${q('default/main')}`);
 check('corrupt reports failure', corrupt.status === 500 && corrupt.json.ok === false);

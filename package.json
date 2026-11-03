@@ -1,7 +1,7 @@
 {
   "name": "dsh-plan-board",
-  "version": "0.1.0",
-  "description": "四分区计划看板：长期 / 中期 / 短期 / 预想 / agent 建议，右栏常驻，一个项目一份 JSON。",
+  "version": "0.2.0",
+  "description": "四分区计划看板：长期 / 中期 / 短期 / 预想 / agent 建议，右栏常驻，一个项目一份 JSON，每条带 L3/S11 这种短编号。",
   "license": "MIT",
   "author": "LTea",
   "repository": {

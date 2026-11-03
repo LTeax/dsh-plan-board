@@ -23,6 +23,10 @@ export const inject = ['webServer'];
 
 const PARTS = ['long', 'mid', 'short', 'idea', 'advice'];
 const DEFAULT_TITLES = { long: '长期', mid: '中期', short: '短期', idea: '预想', advice: 'agent 建议' };
+// 每个分区一个字母前缀：L3 / S11 / A2 这类短编号，人和 agent 都能直接说出来、直接检索。
+const PART_LETTERS = { long: 'L', mid: 'M', short: 'S', idea: 'I', advice: 'A' };
+const LETTERS = PARTS.map((part) => PART_LETTERS[part]);
+const CODE_RE = /^[A-Z]\d{1,3}$/;
 const MAX_BODY = 1024 * 1024;
 const BOARD_FILE = /\.json$/i;
 
@@ -54,6 +58,8 @@ function toSlug(title) {
 function emptyDoc(title) {
   const sections = {};
   for (const part of PARTS) sections[part] = { title: DEFAULT_TITLES[part], items: [] };
+  const codeSeq = {};
+  for (const letter of LETTERS) codeSeq[letter] = 0;
   return {
     version: 1,
     title: title || '未命名',
@@ -61,12 +67,16 @@ function emptyDoc(title) {
     sections,
     // 已完成并"收集"起来的条目。元素带 part（原分区）与时间戳，主列表不再包含它们。
     archive: [],
+    // 各字母的编号高水位：删掉条目也不回退，引用过的编号永远指同一件事。
+    codeSeq,
   };
 }
 
 function normalizeItem(item, part, index) {
   return {
     id: typeof item.id === 'string' && item.id ? item.id : `${part}-${index + 1}`,
+    // 短编号（S3 这种），由 assignCodes 保证不重复；手写的非法编号会被替换。
+    code: typeof item.code === 'string' ? item.code : '',
     text: item.text,
     done: item.done === true,
     // 1 = 最高，3 = 最低，0 = 未设。只认整数 1..3，其余一律当未设。
@@ -81,12 +91,61 @@ function normalizeItem(item, part, index) {
   };
 }
 
+/**
+ * 给每条待办发一个「分区字母 + 序号」的短编号：长期 L、中期 M、短期 S、预想 I、建议 A。
+ * 规则：
+ *   - 已经写好的合法编号原地保留（字母要和分区对得上、全板不重复），引用过的号不搬家；
+ *   - 缺号、错字母、重复的编号在这里改掉，从该字母的高水位继续发；
+ *   - 归档条目照样占号，提出时（restore）尽量回到原编号。
+ * 老文档第一次被读到时补号并立即写回，agent 直接在文件里就能按编号检索。
+ */
+function assignCodes(doc, stats) {
+  const marks = {};
+  for (const letter of LETTERS) {
+    const value = doc.codeSeq && doc.codeSeq[letter];
+    marks[letter] = Number.isInteger(value) && value > 0 ? value : 0;
+  }
+  const taken = new Set();
+  const keep = (entry, letter) => {
+    const code = typeof entry.code === 'string' ? entry.code : '';
+    if (!CODE_RE.test(code) || code[0] !== letter || taken.has(code)) return false;
+    taken.add(code);
+    marks[letter] = Math.max(marks[letter], Number(code.slice(1)));
+    return true;
+  };
+  // 先认领全板已写好的编号，再发新号：这样已引用的号不会因为新增条目而变。
+  for (const part of PARTS) {
+    for (const item of doc.sections[part].items) if (!keep(item, PART_LETTERS[part])) item.code = '';
+  }
+  for (const entry of doc.archive) if (!keep(entry, PART_LETTERS[entry.part] || 'A')) entry.code = '';
+
+  const issue = (entry, letter) => {
+    marks[letter] += 1;
+    entry.code = `${letter}${marks[letter]}`;
+    taken.add(entry.code);
+    if (stats) stats.assigned += 1;
+  };
+  for (const part of PARTS) {
+    for (const item of doc.sections[part].items) if (!item.code) issue(item, PART_LETTERS[part]);
+  }
+  for (const entry of doc.archive) if (!entry.code) issue(entry, PART_LETTERS[entry.part] || 'A');
+
+  doc.codeSeq = marks;
+  return doc;
+}
+
 /** Coerce whatever is on disk into the shape the client renders, without inventing items. */
-function normalize(raw, fallbackTitle) {
+function normalize(raw, fallbackTitle, stats) {
   const doc = emptyDoc(fallbackTitle);
   if (!raw || typeof raw !== 'object') return doc;
   if (typeof raw.title === 'string' && raw.title.trim()) doc.title = raw.title;
   if (typeof raw.updatedAt === 'string') doc.updatedAt = raw.updatedAt;
+  if (raw.codeSeq && typeof raw.codeSeq === 'object') {
+    for (const letter of LETTERS) {
+      const value = raw.codeSeq[letter];
+      if (Number.isInteger(value) && value > 0) doc.codeSeq[letter] = value;
+    }
+  }
   const src = raw.sections && typeof raw.sections === 'object' ? raw.sections : {};
   for (const part of PARTS) {
     const section = src[part];
@@ -107,6 +166,7 @@ function normalize(raw, fallbackTitle) {
       completedAt: typeof entry.completedAt === 'string' ? entry.completedAt : '',
       archivedAt: typeof entry.archivedAt === 'string' ? entry.archivedAt : '',
     }));
+  assignCodes(doc, stats);
   return doc;
 }
 
@@ -235,7 +295,17 @@ function readBoard(dir, slug) {
     return { ok: false, slug, error: `读取失败：${error && error.message}` };
   }
   try {
-    return { ok: true, slug, doc: normalize(JSON.parse(text), parsed.plan) };
+    const stats = { assigned: 0 };
+    const doc = normalize(JSON.parse(text), parsed.plan, stats);
+    // 老文档第一次读到就补编号，并立刻落盘，让 agent 在文件里也能按编号检索。
+    if (stats.assigned > 0) {
+      try {
+        writeBoard(dir, slug, doc);
+      } catch {
+        /* 落盘失败不要紧，下一次读取会再补一遍 */
+      }
+    }
+    return { ok: true, slug, doc };
   } catch (error) {
     // Never overwrite a document we cannot parse: it may be hand-edited.
     return { ok: false, slug, error: `${slug}.json 解析失败：${error && error.message}` };
@@ -375,6 +445,8 @@ function restore(doc, aid) {
   const now = new Date().toISOString();
   section.items.push({
     id,
+    // 编号跟着条目走：提出来的还是原来的号，除非那个号已经被别人占了。
+    code: typeof entry.code === 'string' ? entry.code : '',
     text: entry.text,
     done: false,
     priority: entry.priority || 0,
@@ -382,6 +454,7 @@ function restore(doc, aid) {
     updatedAt: now,
     steps: (entry.steps || []).map((step) => ({ text: step.text, done: false })),
   });
+  assignCodes(doc);
   doc.updatedAt = now;
 }
 
