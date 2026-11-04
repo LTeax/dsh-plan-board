@@ -10,8 +10,10 @@
  *               $DSH_HOME/plan-board. A pre-boards `$DSH_HOME/plan-board.json`
  *               is migrated once into `default.json`.
  *
- * Registers no agent tool on purpose: a board is a plain file, so the agent
- * edits it with its ordinary file tools while the panel only flips a done flag.
+ * The agent reaches the board through the `plan_board` tool (and the same
+ * write through POST /plan-board/item): the boards directory lives outside the
+ * workspace, so the agent's own file tools cannot write there under the default
+ * workspace-write sandbox. Hand-editing the JSON still works when it can.
  */
 
 import fs from 'node:fs';
@@ -19,9 +21,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const name = 'plan-board';
-export const inject = ['webServer'];
+export const inject = ['webServer', 'tools'];
 
 const PARTS = ['long', 'mid', 'short', 'idea', 'advice'];
+const TOOL_ACTIONS = ['list', 'read', 'add', 'update', 'toggle'];
 const DEFAULT_TITLES = { long: '长期', mid: '中期', short: '短期', idea: '预想', advice: 'agent 建议' };
 // 每个分区一个字母前缀：L3 / S11 / A2 这类短编号，人和 agent 都能直接说出来、直接检索。
 const PART_LETTERS = { long: 'L', mid: 'M', short: 'S', idea: 'I', advice: 'A' };
@@ -278,7 +281,8 @@ function parseSlug(slug) {
   return { project, plan };
 }
 
-function readBoard(dir, slug) {
+function readBoard(dir, slug, options) {
+  const create = Boolean(options && options.create);
   ensureDir(dir);
   const parsed = parseSlug(slug);
   if (!parsed) return { ok: false, slug, error: `不合法的计划标识：${slug}（应为 项目/计划）` };
@@ -288,6 +292,11 @@ function readBoard(dir, slug) {
     text = fs.readFileSync(file, 'utf8');
   } catch (error) {
     if (error && error.code === 'ENOENT') {
+      // 读路径绝不建文件：面板每 3 秒拉一次状态，ENOENT 时写回空板会把
+      // 刚删掉的计划书原地复活。只有显式写入（add / 新建 / POST item）才建。
+      if (!create) {
+        return { ok: false, slug, missing: true, error: `计划书不存在：${slug}（已被删除，或还没新建）` };
+      }
       const doc = emptyDoc(parsed.plan);
       writeBoard(dir, slug, doc);
       return { ok: true, slug, doc, created: true };
@@ -458,6 +467,213 @@ function restore(doc, aid) {
   doc.updatedAt = now;
 }
 
+/** 追加一条待办并立刻发编号；text 是唯一必填内容。 */
+function addItem(doc, part, input) {
+  const section = doc.sections[part];
+  if (!section) throw new Error(`未知分区：${part}`);
+  const text = typeof input.text === 'string' ? input.text.trim() : '';
+  if (!text) throw new Error('缺少条目正文 text');
+  const now = new Date().toISOString();
+  const item = {
+    // 不能再用 <分区>-<序号>：agent 和工作区外的调用方都会加条目，序号会撞。
+    id: `${part}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    code: '',
+    text,
+    done: false,
+    priority: Number.isInteger(input.priority) && input.priority >= 1 && input.priority <= 3 ? input.priority : 0,
+    note: typeof input.note === 'string' ? input.note.trim() : '',
+    updatedAt: now,
+    steps: Array.isArray(input.steps)
+      ? input.steps
+          .filter((step) => typeof step === 'string' && step.trim())
+          .map((step) => ({ text: step.trim(), done: false }))
+      : [],
+  };
+  section.items.push(item);
+  assignCodes(doc);
+  doc.updatedAt = now;
+  return item;
+}
+
+/** 按编号（S11）或 id 定位条目；给了 part 就只在该分区里找。 */
+function locateItem(doc, { part, code, id }) {
+  if (code && !CODE_RE.test(code)) throw new Error(`编号格式不对：${code}（应形如 S11、L3）`);
+  if (!code && !id) throw new Error('需要 code 或 id 才能定位条目');
+  const parts = part ? [part] : PARTS;
+  for (const name of parts) {
+    const section = doc.sections[name];
+    if (!section) throw new Error(`未知分区：${name}`);
+    for (const item of section.items) {
+      if (code ? item.code === code : item.id === id) return { part: name, item };
+    }
+  }
+  throw new Error(code ? `看板上没有编号 ${code} 的条目` : `看板上没有 id ${id} 的条目`);
+}
+
+/** 只改显式传入的字段；steps 传字符串数组时整体替换并重置进度。 */
+function patchItem(doc, target, patch) {
+  const { item } = target;
+  const now = new Date().toISOString();
+  if (typeof patch.text === 'string' && patch.text.trim()) item.text = patch.text.trim();
+  if (typeof patch.note === 'string') item.note = patch.note.trim();
+  if (Number.isInteger(patch.priority) && patch.priority >= 0 && patch.priority <= 3) item.priority = patch.priority;
+  if (typeof patch.done === 'boolean') {
+    item.done = patch.done;
+    if (item.done) for (const step of item.steps) step.done = true;
+  }
+  if (Array.isArray(patch.steps)) {
+    item.steps = patch.steps
+      .map((step) =>
+        typeof step === 'string'
+          ? { text: step.trim(), done: false }
+          : step && typeof step.text === 'string'
+            ? { text: step.text.trim(), done: step.done === true }
+            : null,
+      )
+      .filter((step) => step && step.text);
+  }
+  item.updatedAt = now;
+  doc.updatedAt = now;
+  return item;
+}
+
+/** agent/工具看到的条目形状：编号在前，进度用 [x] 标出来。 */
+function viewItem(item) {
+  return {
+    code: item.code,
+    text: item.text,
+    done: item.done === true,
+    ...(item.priority ? { priority: item.priority } : {}),
+    ...(item.note ? { note: item.note } : {}),
+    ...(item.steps.length ? { steps: item.steps.map((step) => `${step.done ? '[x]' : '[ ]'} ${step.text}`) } : {}),
+  };
+}
+
+function viewBoard(doc, slug) {
+  const sections = {};
+  for (const part of PARTS) {
+    sections[part] = { title: doc.sections[part].title, items: doc.sections[part].items.map(viewItem) };
+  }
+  return { board: slug, title: doc.title, updatedAt: doc.updatedAt, sections, archived: doc.archive.length };
+}
+
+/**
+ * 工具/路由没给 board 时：只有一份计划书就用它，一份都没有就用 default/main，
+ * 有多份就报错让调用方指名——比默默挑"最近改过的"更容易让人发现写错了板子。
+ */
+function pickBoard(dir, requested) {
+  if (typeof requested === 'string' && requested.trim()) return requested.trim();
+  const boards = listBoards(dir);
+  if (boards.length === 0) return 'default/main';
+  if (boards.length === 1) return boards[0].slug;
+  throw new Error(`这里有多份计划书，请用 board 指明：${boards.map((board) => board.slug).join('、')}`);
+}
+
+/**
+ * agent 工具。宿主进程自己写盘，绕开 workspace-write 沙箱；描述里写清楚
+ * "要写计划的时候就写进看板"，这是模型唯一会读到的触发面。
+ */
+function registerPlanBoardTool(ctx, boardsDir) {
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'plan_board',
+      description:
+        'Read and change the user\'s plan board — the right-sidebar panel where they keep plans, one board per project. Use it whenever the user asks for a plan, roadmap, schedule, phase breakdown, or TODO list, and whenever you finish or advance such work: add the items to the board instead of creating a separate plan or TODO markdown file, then keep their status current as you go. Boards are named "<project>/<plan>" such as "m10264/csv-editor"; action=list shows them, and board may be omitted only when exactly one exists. Sections: long 长期, mid 中期, short 短期 are dated horizons; idea 预想 holds uncommitted ideas; advice agent 建议 is where your own proposals go. Every item carries a short code such as S11 or L3 — use that code in later calls and when replying to the user. Read the board before writing so existing wording and order survive. One item is one line of work; note holds a short detail, steps holds the sub-steps.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: {
+            type: 'string',
+            enum: TOOL_ACTIONS,
+            description: 'list = every board; read = one board; add = append an item; update = change fields of one item; toggle = flip one item\'s done flag.',
+          },
+          board: {
+            type: 'string',
+            description: '"<project>/<plan>" from action=list. Omit only when exactly one board exists.',
+          },
+          part: {
+            type: 'string',
+            enum: PARTS,
+            description: 'Board section. Required for add; optional for update/toggle, which then find the item by code across sections. long=长期, mid=中期, short=短期, idea=预想, advice=agent 建议.',
+          },
+          code: {
+            type: 'string',
+            description: 'Item code such as S11 or L3, as shown on the board. Required for update/toggle unless id is given.',
+          },
+          id: {
+            type: 'string',
+            description: 'Internal item id. Prefer code.',
+          },
+          text: {
+            type: 'string',
+            description: 'Item text: one line, imperative. Required for add; for update it replaces the text.',
+          },
+          note: {
+            type: 'string',
+            description: 'Optional one-line detail shown under the item text.',
+          },
+          priority: {
+            type: 'integer',
+            enum: [0, 1, 2, 3],
+            description: '1 high, 2 medium, 3 low, 0 unset.',
+          },
+          steps: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Sub-steps. On update they replace the existing steps and reset their progress.',
+          },
+          done: {
+            type: 'boolean',
+            description: 'For update: set completion explicitly instead of flipping it.',
+          },
+        },
+        required: ['action'],
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: String(value) }],
+      },
+      async execute(args) {
+        const action = args.action;
+        if (!TOOL_ACTIONS.includes(action)) throw new Error(`action 只能是 ${TOOL_ACTIONS.join(' / ')}`);
+        if (action === 'list') {
+          const boards = listBoards(boardsDir).map(({ slug, title, count, updatedAt }) => ({
+            board: slug,
+            title,
+            items: count,
+            updatedAt,
+          }));
+          return JSON.stringify({ dir: boardsDir, boards });
+        }
+        const slug = pickBoard(boardsDir, args.board);
+        // 只有 add 是显式写入，允许顺手建板；read / update / toggle 遇到缺失就报错。
+        const current = readBoard(boardsDir, slug, { create: action === 'add' });
+        if (!current.ok) throw new Error(current.error || `读取 ${slug} 失败`);
+        const doc = current.doc;
+        if (action === 'read') return JSON.stringify(viewBoard(doc, slug));
+        if (action === 'add') {
+          if (!PARTS.includes(args.part)) throw new Error(`add 需要 part，取 ${PARTS.join(' / ')} 之一`);
+          const item = addItem(doc, args.part, args);
+          writeBoard(boardsDir, slug, doc);
+          return JSON.stringify({ board: slug, part: args.part, added: viewItem(item) });
+        }
+        const target = locateItem(doc, { part: args.part, code: args.code, id: args.id });
+        if (action === 'toggle') {
+          target.item.done = !target.item.done;
+          if (target.item.done) for (const step of target.item.steps) step.done = true;
+          target.item.updatedAt = new Date().toISOString();
+          doc.updatedAt = target.item.updatedAt;
+        } else {
+          patchItem(doc, target, args);
+        }
+        writeBoard(boardsDir, slug, doc);
+        return JSON.stringify({ board: slug, part: target.part, item: viewItem(target.item) });
+      },
+    }),
+  );
+}
+
 export function apply(ctx, config) {
   const boardsDir = resolveBoardsDir(config);
 
@@ -481,7 +697,9 @@ export function apply(ctx, config) {
         const boards = listBoards(boardsDir);
         const slug = boardFromUrl(req.url) || (boards[0] && boards[0].slug) || 'default/main';
         const result = readBoard(boardsDir, slug);
-        sendJson(res, result.ok ? 200 : 500, { ...result, boards, dir: boardsDir });
+        // 读接口不建文件：面板每 3 秒轮询一次，把 ENOENT 当成"建一块空板"会让
+        // 删掉的计划书在下次轮询时原地复活（计划书被删、面板还开着时必现）。
+        sendJson(res, result.ok ? 200 : result.missing ? 404 : 500, { ...result, boards, dir: boardsDir });
       },
     }),
   );
@@ -501,7 +719,7 @@ export function apply(ctx, config) {
           if (typeof id !== 'string' || !id) return sendJson(res, 400, { ok: false, error: '缺少条目 id' });
           const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
-          if (!current.ok) return sendJson(res, 409, current);
+          if (!current.ok) return sendJson(res, current.missing ? 404 : 409, current);
           toggle(current.doc, part, id, step);
           writeBoard(boardsDir, slug, current.doc);
           sendJson(res, 200, { ok: true, slug, doc: current.doc, boards: listBoards(boardsDir) });
@@ -561,7 +779,7 @@ export function apply(ctx, config) {
           if (![0, 1, 2, 3].includes(next)) return sendJson(res, 400, { ok: false, error: 'priority 只能是 0..3' });
           const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
-          if (!current.ok) return sendJson(res, 409, current);
+          if (!current.ok) return sendJson(res, current.missing ? 404 : 409, current);
           const item = current.doc.sections[part].items.find((candidate) => candidate.id === id);
           if (!item) return sendJson(res, 404, { ok: false, error: `未找到条目：${id}` });
           item.priority = next;
@@ -591,7 +809,7 @@ export function apply(ctx, config) {
           if (typeof id !== 'string' || !id) return sendJson(res, 400, { ok: false, error: '缺少条目 id' });
           const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
-          if (!current.ok) return sendJson(res, 409, current);
+          if (!current.ok) return sendJson(res, current.missing ? 404 : 409, current);
           collect(current.doc, part, id);
           writeBoard(boardsDir, slug, current.doc);
           sendJson(res, 200, { ok: true, slug, doc: current.doc, boards: listBoards(boardsDir) });
@@ -616,7 +834,7 @@ export function apply(ctx, config) {
           if (typeof aid !== 'string' || !aid) return sendJson(res, 400, { ok: false, error: '缺少归档 id' });
           const slug = resolveSlug(boardsDir, board);
           const current = readBoard(boardsDir, slug);
-          if (!current.ok) return sendJson(res, 409, current);
+          if (!current.ok) return sendJson(res, current.missing ? 404 : 409, current);
           restore(current.doc, aid);
           writeBoard(boardsDir, slug, current.doc);
           sendJson(res, 200, { ok: true, slug, doc: current.doc, boards: listBoards(boardsDir) });
@@ -626,4 +844,31 @@ export function apply(ctx, config) {
       },
     }),
   );
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/plan-board/item',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+        const denied = rejectWrite(req);
+        if (denied) return sendJson(res, 403, { ok: false, error: denied });
+        try {
+          const body = await readBody(req);
+          const part = body && body.part;
+          if (!PARTS.includes(part)) return sendJson(res, 400, { ok: false, error: '未知分区' });
+          const slug = pickBoard(boardsDir, body.board);
+          const current = readBoard(boardsDir, slug, { create: true });
+          if (!current.ok) return sendJson(res, 404, current);
+          const item = addItem(current.doc, part, body);
+          writeBoard(boardsDir, slug, current.doc);
+          sendJson(res, 200, { ok: true, slug, item: viewItem(item), doc: current.doc });
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: String((error && error.message) || error) });
+        }
+      },
+    }),
+  );
+
+  registerPlanBoardTool(ctx, boardsDir);
 }

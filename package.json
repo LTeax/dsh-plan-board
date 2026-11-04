@@ -1,7 +1,7 @@
 {
   "name": "dsh-plan-board",
-  "version": "0.2.0",
-  "description": "四分区计划看板：长期 / 中期 / 短期 / 预想 / agent 建议，右栏常驻，一个项目一份 JSON，每条带 L3/S11 这种短编号。",
+  "version": "0.3.1",
+  "description": "四分区计划看板：长期 / 中期 / 短期 / 预想 / agent 建议，右栏常驻，一个项目一份 JSON，每条带 L3/S11 这种短编号；带 plan_board agent 工具。",
   "license": "MIT",
   "author": "LTea",
   "repository": {
@@ -15,7 +15,8 @@
     "deepseek-harness",
     "plan",
     "todo",
-    "sidebar"
+    "sidebar",
+    "agent-tool"
   ],
   "type": "module",
   "exports": {

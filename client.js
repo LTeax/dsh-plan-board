@@ -281,7 +281,17 @@ window.__ModuleLoader__.load({
         async (slug) => {
           try {
             const payload = await fetchState(slug === undefined ? board : slug);
-            setBoards(payload.boards || []);
+            const nextBoards = payload.boards || [];
+            setBoards(nextBoards);
+            if (payload.missing) {
+              // 正在看的计划书被删了：退到第一块板（一块不剩就清空等用户新建）。
+              // 不能把它当成"文档为空"，否则每 3 秒弹一次红字，还会让人以为板子还在。
+              const fallback = nextBoards.length > 0 ? nextBoards[0].slug : '';
+              setBoard(fallback);
+              remember(fallback);
+              setState({ loading: false, ok: true, doc: null, error: '' });
+              return;
+            }
             const active = payload.slug || '';
             if (active && active !== board) setBoard(active);
             setState({ loading: false, ok: payload.ok !== false, doc: payload.doc || null, error: payload.error || '' });
@@ -289,7 +299,7 @@ window.__ModuleLoader__.load({
             setState({ loading: false, ok: false, doc: null, error: String((error && error.message) || error) });
           }
         },
-        [board],
+        [board, remember],
       );
 
       useEffect(() => {
